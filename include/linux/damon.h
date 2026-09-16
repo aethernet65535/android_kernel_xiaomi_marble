@@ -537,6 +537,7 @@ struct damon_attrs {
  * Note that the monitoring thread protects only @kdamond via @kdamond_lock.
  * Accesses to other fields must be protected by themselves.
  *
+ * @pause:	Pause kdamond main loop.
  * @ops:	Set of monitoring operations for given use cases.
  * @callback:	Set of callbacks for monitoring events notifications.
  *
@@ -565,6 +566,8 @@ struct damon_ctx {
 /* public: */
 	struct task_struct *kdamond;
 	struct mutex kdamond_lock;
+
+	bool pause;
 
 	struct damon_operations ops;
 	struct damon_callback callback;

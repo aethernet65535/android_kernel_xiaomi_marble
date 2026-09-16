@@ -1485,6 +1485,15 @@ static int kdamond_fn(void *data)
 		if (kdamond_wait_activation(ctx))
 			break;
 
+		while (ctx->pause) {
+			kdamond_usleep(sample_interval);
+			if (kdamond_need_stop(ctx))
+				goto done;
+			if (ctx->callback.after_wmarks_check &&
+					ctx->callback.after_wmarks_check(ctx))
+				goto done;
+		}
+
 		if (ctx->ops.prepare_access_checks)
 			ctx->ops.prepare_access_checks(ctx);
 		if (ctx->callback.after_sampling &&
