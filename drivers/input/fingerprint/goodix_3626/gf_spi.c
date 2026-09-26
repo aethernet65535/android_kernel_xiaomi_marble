@@ -77,12 +77,6 @@ static void *cookie = NULL;
 
 #define N_SPI_MINORS			32  /* ... up to 256 */
 
-static DEFINE_MUTEX(regulator_ocp_lock);
-
-static struct regulator *p_3v3_vreg = NULL;
-static int disable_regulator_3V3(void);
-static int enable_regulator_3V3(struct device *dev);
-
 #ifndef GOODIX_DRM_INTERFACE_WA
 static unsigned int __read_mostly screenoff_cooling = 0;
 
@@ -104,85 +98,6 @@ static int set_screenoff_cooling(const char *buf, const struct kernel_param *kp)
 module_param_call(screenoff_cooling, set_screenoff_cooling, param_get_uint,
 		  &screenoff_cooling, 0600);
 #endif
-
-static int disable_regulator_3V3(void)
-{
-	int rc = 0;
-	mutex_lock(&regulator_ocp_lock);
-	if(p_3v3_vreg == NULL) {
-		pr_err("p_3v3_vreg is null!");
-		mutex_unlock(&regulator_ocp_lock);
-		return 0;
-	}
-
-	if (regulator_is_enabled(p_3v3_vreg)) {
-		pr_err( "regulator_is_enabled and do powered-off\n");
-
-		rc = regulator_disable(p_3v3_vreg);
-		if (rc) {
-			pr_err("disable voltage failed\n");
-			mutex_unlock(&regulator_ocp_lock);
-			return rc;
-		}
-	}
-
-	devm_regulator_put(p_3v3_vreg);
-	p_3v3_vreg = NULL;
-	mutex_unlock(&regulator_ocp_lock);
-	pr_err("disable_regulator_3V3 finish\n");
-	return 0;
-}
-
-static int enable_regulator_3V3(struct device *dev)
-{
-
-	int rc = 0;
-	//struct regulator *vreg;
-	mutex_lock(&regulator_ocp_lock);
-	p_3v3_vreg = devm_regulator_get(dev, "l6c_vdd");
-	if (IS_ERR(p_3v3_vreg)) {
-		pr_err("fp %s: no of vreg found\n", __func__);
-		mutex_unlock(&regulator_ocp_lock);
-		return PTR_ERR(p_3v3_vreg);
-	} else {
-		pr_err("fp %s: of vreg successful found\n", __func__);
-	}
-
-#if 0
-    rc = regulator_set_voltage(vreg, 3300000, 3300000);
-
-	if (rc) {
-		dev_err(dev, "xiaomi %s: set voltage failed\n",__func__);
-		return rc;
-	}
-#endif
-
-	if (regulator_is_enabled(p_3v3_vreg)) {
-		dev_err(dev, "%s: regulator_is_enabled!\n", __func__);
-		mutex_unlock(&regulator_ocp_lock);
-		return 0;
-	}
-
-	rc = regulator_set_load(p_3v3_vreg, 200000);
-	if (rc) {
-		dev_err(dev, "fp %s: set load faild\n", __func__);
-		devm_regulator_put(p_3v3_vreg);
-		p_3v3_vreg = NULL;
-		mutex_unlock(&regulator_ocp_lock);
-		return rc;
-	}
-
-	rc = regulator_enable(p_3v3_vreg);
-	if (rc) {
-		dev_err(dev, "fp %s: enable voltage failed\n", __func__);
-		mutex_unlock(&regulator_ocp_lock);
-		return rc;
-	}
-	//p_3v3_vreg = vreg;
-	mutex_unlock(&regulator_ocp_lock);
-	pr_err("enable_regulator_3V3 finish\n");
-	return rc;
-}
 
 static int SPIDEV_MAJOR;
 
@@ -211,6 +126,48 @@ struct gf_key_map maps[] = {
 	{ EV_KEY, GF_NAV_INPUT_HEAVY },
 #endif
 };
+
+static void disable_regulators(struct gf_supplies *supplies)
+{
+	if (!IS_ERR_OR_NULL(supplies->vdda))
+		regulator_disable(supplies->vdda);
+	if (!IS_ERR_OR_NULL(supplies->vddb))
+		regulator_disable(supplies->vddb);
+}
+
+static int enable_regulators(struct device *dev, struct gf_supplies *supplies)
+{
+	int rc = 0;
+
+	supplies->vdda = devm_regulator_get_optional(dev, "vdda");
+	if (IS_ERR(supplies->vdda)) {
+		rc = PTR_ERR(supplies->vdda);
+		return rc;
+	}
+
+	supplies->vddb = devm_regulator_get_optional(dev, "vddb");
+	if (IS_ERR(supplies->vddb)) {
+		rc = PTR_ERR(supplies->vddb);
+		if (rc == -ENODEV)
+			supplies->vddb = NULL;
+		else
+			return rc;
+	}
+
+	rc = regulator_set_load(supplies->vdda, 200000);
+	if (rc) return rc;
+	rc = regulator_enable(supplies->vdda);
+	if (rc) return rc;
+
+	if (supplies->vddb) {
+		rc = regulator_set_load(supplies->vddb, 200000);
+		if (rc) return rc;
+		rc = regulator_enable(supplies->vddb);
+		if (rc) return rc;
+	}
+
+	return rc;
+}
 
 static void gf_enable_irq(struct gf_dev *gf_dev)
 {
@@ -413,8 +370,8 @@ static void nav_event_input(struct gf_dev *gf_dev, gf_nav_event_t nav_event)
 		break;
 
 	case GF_NAV_CLICK:
-		nav_input = GF_NAV_INPUT_CLICK;
-		pr_debug("%s nav click\n", __func__);
+		//nav_input = GF_NAV_INPUT_CLICK;
+		pr_debug("%s ignored nav single click\n", __func__);
 		break;
 
 	case GF_NAV_HEAVY:
@@ -437,7 +394,7 @@ static void nav_event_input(struct gf_dev *gf_dev, gf_nav_event_t nav_event)
 		break;
 	}
 
-	if ((nav_event != GF_NAV_FINGER_DOWN) && (nav_event != GF_NAV_FINGER_UP)) {
+	if (nav_input != 0) {
 		input_report_key(gf_dev->input, nav_input, 1);
 		input_sync(gf_dev->input);
 		input_report_key(gf_dev->input, nav_input, 0);
@@ -474,10 +431,12 @@ static void gf_kernel_key_input(struct gf_dev *gf_dev, struct gf_key *gf_key)
 		input_sync(gf_dev->input);
 	}
 
-	if (GF_KEY_HOME == gf_key->key || GF_KEY_HOME_DOUBLE_CLICK == gf_key->key) {
-		pr_debug("input report key event single or double click");
+	if (GF_KEY_HOME_DOUBLE_CLICK == gf_key->key) {
+		pr_debug("input report key event double click");
 		input_report_key(gf_dev->input, key_input, gf_key->value);
 		input_sync(gf_dev->input);
+	} else if (GF_KEY_HOME == gf_key->key) {
+		pr_debug("ignored key event single click");
 	}
 }
 
@@ -489,7 +448,6 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	gf_nav_event_t nav_event = GF_NAV_NONE;
 #endif
 	int retval = 0;
-	int status = 0;
 	u8 netlink_route = NETLINK_TEST;
 	struct gf_ioc_chip_info info;
 
@@ -588,12 +546,6 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (gf_dev->device_available == 1) {
 			pr_debug("Sensor has already powered-on.\n");
 		} else {
-			status = enable_regulator_3V3(&gf_dev->spi->dev);
-			pr_err("p_3v3_vreg 001 = %p\n", p_3v3_vreg);
-			if(status) {
-				pr_err("enable regulator failed and disable it.\n");
-				disable_regulator_3V3();
-			}
 			gf_power_on(gf_dev);
 		}
 
@@ -606,8 +558,6 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (gf_dev->device_available == 0) {
 			pr_debug("Sensor has already powered-off.\n");
 		} else {
-			pr_err("Sensor try do powered-off.\n");
-			disable_regulator_3V3();
 			gf_power_off(gf_dev);
 		}
 
@@ -712,32 +662,6 @@ static int gf_open(struct inode *inode, struct file *filp)
 			break;
 		}
 	}
-#ifdef CONFIG_FINGERPRINT_FP_VREG_CONTROL
-	pr_info("Try to enable fp_vdd_vreg\n");
-	gf_dev->vreg = regulator_get(&gf_dev->spi->dev, "fp_vdd_vreg");
-
-	if (gf_dev->vreg == NULL) {
-		dev_err(&gf_dev->spi->dev, "fp_vdd_vreg regulator get failed!\n");
-		mutex_unlock(&device_list_lock);
-		return -EPERM;
-	}
-
-	if (regulator_is_enabled(gf_dev->vreg)) {
-		pr_info("fp_vdd_vreg is already enabled!\n");
-	} else {
-		rc = regulator_enable(gf_dev->vreg);
-
-		if (rc) {
-			dev_err(&gf_dev->spi->dev, "error enabling fp_vdd_vreg!\n");
-			regulator_put(gf_dev->vreg);
-			gf_dev->vreg = NULL;
-			mutex_unlock(&device_list_lock);
-			return -EPERM;
-		}
-	}
-
-	pr_info("fp_vdd_vreg is enabled %d!\n",regulator_get_voltage(gf_dev->vreg));
-#endif
 
 	if (status == 0) {
 #ifdef GF_PW_CTL
@@ -827,19 +751,6 @@ static int gf_release(struct inode *inode, struct file *filp)
 	mutex_lock(&device_list_lock);
 	gf_dev = filp->private_data;
 	filp->private_data = NULL;
-	/*
-	 *Disable fp_vdd_vreg regulator
-	 */
-#ifdef CONFIG_FINGERPRINT_FP_VREG_CONTROL
-	pr_info("disable fp_vdd_vreg!\n");
-
-	if (regulator_is_enabled(gf_dev->vreg)) {
-		//regulator_disable(gf_dev->vreg);
-		//regulator_put(gf_dev->vreg);
-		//gf_dev->vreg = NULL;
-	}
-
-#endif
 	gf_dev->users--;
 
 	if (!gf_dev->users) {
@@ -850,7 +761,6 @@ static int gf_release(struct inode *inode, struct file *filp)
 		free_irq(gf_dev->irq, gf_dev);
 		gpio_free(gf_dev->irq_gpio);
 		gpio_free(gf_dev->reset_gpio);
-		disable_regulator_3V3();
 		gf_power_off(gf_dev);
 #ifdef GF_PW_CTL
 		gpio_free(gf_dev->pwr_gpio);
@@ -1186,6 +1096,11 @@ static int gf_probe(struct platform_device *pdev)
 		}
 	}
 
+	status = enable_regulators(&gf_dev->spi->dev, &gf_dev->supplies);
+	if (status) {
+		goto error_regulator;
+	}
+
 #ifdef AP_CONTROL_CLK
 	pr_debug("Get the clk resource.\n");
 
@@ -1217,7 +1132,13 @@ gfspi_probe_clk_enable_failed:
 	gfspi_ioctl_clk_uninit(gf_dev);
 gfspi_probe_clk_init_failed:
 #endif
+error_regulator:
+	disable_regulators(&gf_dev->supplies);
+
+	/* input_unregister_device calls input_free_device */
 	input_unregister_device(gf_dev->input);
+	gf_dev->input = NULL;
+
 error_input:
 
 	if (gf_dev->input != NULL) {
@@ -1248,8 +1169,9 @@ static int gf_remove(struct platform_device *pdev)
 #endif
 {
 	struct gf_dev *gf_dev = &gf;
-	pr_debug("%s\n", __func__);
-	disable_regulator_3V3();
+
+	disable_regulators(&gf_dev->supplies);
+
 	wakeup_source_unregister(fp_wakelock);
 	fp_wakelock = NULL;
 	/* make sure ops on existing fds can abort cleanly */

@@ -393,6 +393,7 @@ static int goodix_parse_firmware(struct firmware_data *fw_data)
 		fw_offset += fw_summary->subsys[i].size;
 	}
 
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_DEBUG
 	ts_info("Firmware package protocol: V%u", fw_summary->protocol_ver);
 	ts_info("Firmware PID:GT%s", fw_summary->fw_pid);
 	ts_info("Firmware VID:%*ph", 4, fw_summary->fw_vid);
@@ -411,6 +412,7 @@ static int goodix_parse_firmware(struct firmware_data *fw_data)
 				fw_summary->subsys[i].flash_addr);
 		ts_debug("Subsystem Ptr:%p", fw_summary->subsys[i].data);
 	}
+#endif
 
 	if (fw_summary->chip_type == CHIP_TYPE_BRA &&
 		ic_type != IC_TYPE_BERLIN_A) {
@@ -949,6 +951,10 @@ int goodix_fw_update_proc(struct fw_update_ctrl *fwu_ctrl)
 
 	if (!(fwu_ctrl->mode & UPDATE_MODE_FORCE)) {
 		ret = goodix_fw_version_compare(fwu_ctrl);
+		if (!ret) {
+			ts_info("firmware upgraded");
+			return 0;
+		}
 		ts_info("need to upgrade");
 	}
 
@@ -997,7 +1003,7 @@ err_fw_prepare:
  *       '6'[110] update in unblocking mode with fwdata from request
  */
 static ssize_t goodix_sysfs_update_en_store(
-		struct device *dev, struct device_attribute *attr,
+		struct kobject *kobj, struct kobj_attribute *attr,
 		const char *buf, size_t count)
 {
 	int ret = 0;
@@ -1066,7 +1072,7 @@ static ssize_t goodix_sysfs_fwimage_store(struct file *file,
 
 /* return fw_update result */
 static ssize_t goodix_sysfs_result_show(
-		struct device *dev, struct device_attribute *attr,
+		struct kobject *kobj, struct kobj_attribute *attr,
 		char *buf)
 {
 	struct fw_update_ctrl *fw_ctrl = &goodix_fw_update_ctrl;
@@ -1101,12 +1107,14 @@ static ssize_t goodix_sysfs_result_show(
 	return r;
 }
 
-static DEVICE_ATTR(update_en, 0220, NULL, goodix_sysfs_update_en_store);
-static DEVICE_ATTR(result, 0664, goodix_sysfs_result_show, NULL);
+static struct kobj_attribute goodix_sysfs_update =
+	__ATTR(update_en, 0220, NULL, goodix_sysfs_update_en_store);
+static struct kobj_attribute goodix_sysfs_result =
+	__ATTR(result, 0664, goodix_sysfs_result_show, NULL);
 
 static struct attribute *goodix_fwu_attrs[] = {
-	&dev_attr_update_en.attr,
-	&dev_attr_result.attr
+	&goodix_sysfs_update.attr,
+	&goodix_sysfs_result.attr
 };
 
 static int goodix_fw_sysfs_init(struct goodix_ts_core *core_data,

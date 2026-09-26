@@ -231,9 +231,12 @@ static int brl_power_on(struct goodix_ts_core *cd, bool on)
 				goto power_off;
 			}
 		}
+
+		gpio_direction_output(cd->board_data.reset_gpio, 0);
 		usleep_range(15000, 15100);
-		gpio_direction_output(reset_gpio, 1);
-		usleep_range(4000, 4100);
+		gpio_direction_output(cd->board_data.reset_gpio, 1);
+		msleep(GOODIX_NORMAL_RESET_DELAY_MS);
+
 		ret = brl_dev_confirm(cd);
 		if (ret < 0)
 			goto power_off;
@@ -241,7 +244,6 @@ static int brl_power_on(struct goodix_ts_core *cd, bool on)
 		if (ret < 0)
 			goto power_off;
 
-		msleep(GOODIX_NORMAL_RESET_DELAY_MS);
 		return 0;
 	}
 
@@ -275,6 +277,67 @@ int brl_suspend(struct goodix_ts_core *cd)
 	return 0;
 }
 
+#define GOODIX_BRLD_CMD_RAWDATA 0x90
+#define GOODIX_BRLD_CMD_COORD 0x91
+int brl_set_coor_mode(struct goodix_ts_core *cd) {
+	struct goodix_ts_cmd cmd;
+	int ret = 0;
+
+	if (cd->bus->ic_type != IC_TYPE_BERLIN_D)
+		return ret;
+
+	ts_debug("brld_set_coor_mode, init_stage: %d", cd->init_stage);
+
+	if (cd->init_stage < CORE_INIT_STAGE2)
+		goto exit;
+
+	// Disable rawdata mode
+	cmd.cmd = GOODIX_BRLD_CMD_RAWDATA;
+	cmd.data[0] = 0;
+	cmd.len = 5;
+	ret = cd->hw_ops->send_cmd(cd, &cmd);
+	if (ret < 0) {
+		ts_err("could not disable rawdata mode, err %d", ret);
+		goto exit;
+	}
+
+	// Enable coor mode
+	cmd.cmd = GOODIX_BRLD_CMD_COORD;
+	cmd.data[0] = 0x81;
+	cmd.len = 5;
+	ret = cd->hw_ops->send_cmd(cd, &cmd);
+	if (ret < 0) {
+		ts_err("could not enable coor mode, err: %d", ret);
+		goto exit;
+	}
+
+	ts_debug("successfully enabled coor mode");
+
+exit:
+	return ret;
+}
+
+#define GOODIX_HIGH_RATE_CMD 0xC0
+static int brl_switch_report_rate(struct goodix_ts_core *cd, bool high)
+{
+	struct goodix_ts_cmd cmd;
+	int ret = 0;
+
+	cmd.cmd = GOODIX_HIGH_RATE_CMD;
+	cmd.len = 5;
+	cmd.data[0] = high;
+	ret = cd->hw_ops->send_cmd(cd, &cmd);
+	if (ret < 0) {
+		ts_err("failed to send report rate cmd, high = %d", high);
+		goto exit;
+	}
+	ts_info("report rate switch: %s", high ? "480HZ" : "240HZ");
+	cd->high_report_rate = high;
+
+exit:
+	return ret;
+}
+
 int brl_resume(struct goodix_ts_core *cd)
 {
 	int ret = 0;
@@ -295,17 +358,21 @@ int brl_resume(struct goodix_ts_core *cd)
 int brl_gesture(struct goodix_ts_core *cd, int gesture_type)
 {
 	struct goodix_ts_cmd cmd;
+	int ret = 0;
 
 	if (cd->bus->ic_type == IC_TYPE_BERLIN_A)
 		cmd.cmd = GOODIX_GESTURE_CMD_BA;
 	else
 		cmd.cmd = GOODIX_GESTURE_CMD;
-	cmd.len = 5;
-	cmd.data[0] = gesture_type;
-	if (cd->hw_ops->send_cmd(cd, &cmd))
+	cmd.len = 6;
+	cmd.data[0] = (gesture_type >> 0) & 0x01;
+	cmd.data[1] = (gesture_type >> 1) & 0x01;
+
+	ret = cd->hw_ops->send_cmd(cd, &cmd);
+	if (ret)
 		ts_err("failed send gesture cmd");
 
-	return 0;
+	return ret;
 }
 
 static int brl_reset(struct goodix_ts_core *cd, int delay)
@@ -332,11 +399,11 @@ static int brl_irq_enbale(struct goodix_ts_core *cd, bool enable)
 	}
 
 	if (!enable && atomic_cmpxchg(&cd->irq_enabled, 1, 0)) {
-		disable_irq(cd->irq);
+		disable_irq_nosync(cd->irq);
 		ts_debug("Irq disabled");
 		return 0;
 	}
-	ts_info("warnning: irq deepth inbalance!");
+	ts_info("warning: irq depth imbalance!");
 	return 0;
 }
 
@@ -708,6 +775,7 @@ static int brl_read_version(struct goodix_ts_core *cd,
 	}
 	memcpy(version, buf, sizeof(*version));
 	memcpy(temp_pid, version->rom_pid, sizeof(version->rom_pid));
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_DEBUG
 	ts_info("rom_pid:%s", temp_pid);
 	ts_info("rom_vid:%*ph", (int)sizeof(version->rom_vid),
 		version->rom_vid);
@@ -715,6 +783,7 @@ static int brl_read_version(struct goodix_ts_core *cd,
 	ts_info("vid:%*ph", (int)sizeof(version->patch_vid),
 		version->patch_vid);
 	ts_info("sensor_id:%d", version->sensor_id);
+#endif
 
 	return 0;
 }
@@ -728,6 +797,7 @@ static int convert_ic_info(struct goodix_ic_info *info, const u8 *data)
 	struct goodix_ic_info_feature *feature = &info->feature;
 	struct goodix_ic_info_param *parm = &info->parm;
 	struct goodix_ic_info_misc *misc = &info->misc;
+	struct goodix_ic_info_other *other = &info->other;
 
 	info->length = le16_to_cpup((__le16 *)data);
 
@@ -846,9 +916,13 @@ static int convert_ic_info(struct goodix_ic_info *info, const u8 *data)
 	LE32_TO_CPU(misc->noise_data_addr);
 	LE32_TO_CPU(misc->esd_addr);
 
+	data += sizeof(*misc);
+	memcpy((u8 *)other, data, sizeof(*other));
+
 	return 0;
 }
 
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_DEBUG
 static void print_ic_info(struct goodix_ic_info *ic_info)
 {
 	struct goodix_ic_info_version *version = &ic_info->version;
@@ -919,6 +993,9 @@ static void print_ic_info(struct goodix_ic_info *ic_info)
 	ts_info("esd_addr:                      0x%04X",
 		misc->esd_addr);
 }
+#else
+static inline void print_ic_info(struct goodix_ic_info *ic_info) { }
+#endif
 
 static int brl_get_ic_info(struct goodix_ts_core *cd,
 	struct goodix_ic_info *ic_info)
@@ -1059,6 +1136,7 @@ static void goodix_parse_finger(struct goodix_touch_data *touch_data,
 	touch_data->touch_num = touch_num;
 }
 
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_PEN
 static unsigned int goodix_pen_btn_code[] = {BTN_STYLUS, BTN_STYLUS2};
 static void goodix_parse_pen(struct goodix_pen_data *pen_data,
 	u8 *buf, int touch_num)
@@ -1095,6 +1173,7 @@ static void goodix_parse_pen(struct goodix_pen_data *pen_data,
 		pen_data->keys[i].status = TS_TOUCH;
 	}
 }
+#endif
 
 static int goodix_touch_handler(struct goodix_ts_core *cd,
 				struct goodix_ts_event *ts_event,
@@ -1103,14 +1182,16 @@ static int goodix_touch_handler(struct goodix_ts_core *cd,
 	struct goodix_ts_hw_ops *hw_ops = cd->hw_ops;
 	struct goodix_ic_info_misc *misc = &cd->ic_info.misc;
 	struct goodix_touch_data *touch_data = &ts_event->touch_data;
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_PEN
 	struct goodix_pen_data *pen_data = &ts_event->pen_data;
+	u8 point_type = 0;
+	static u8 pre_pen_num;
+#endif
 	static u8 buffer[IRQ_EVENT_HEAD_LEN +
 			 BYTES_PER_POINT * GOODIX_MAX_TOUCH + 2];
 	u8 touch_num = 0;
 	int ret = 0;
-	u8 point_type = 0;
 	static u8 pre_finger_num;
-	static u8 pre_pen_num;
 
 	/* clean event buffer */
 	memset(ts_event, 0, sizeof(*ts_event));
@@ -1139,6 +1220,7 @@ static int goodix_touch_handler(struct goodix_ts_core *cd,
 	hw_ops->after_event_handler(cd);
 
 	if (touch_num > 0) {
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_PEN
 		point_type = buffer[IRQ_EVENT_HEAD_LEN] & 0x0F;
 		if (point_type == POINT_TYPE_STYLUS ||
 				point_type == POINT_TYPE_STYLUS_HOVER) {
@@ -1151,7 +1233,9 @@ static int goodix_touch_handler(struct goodix_ts_core *cd,
 						&buffer[IRQ_EVENT_HEAD_LEN]);
 				return -EINVAL;
 			}
-		} else {
+		} else
+#endif
+		{
 			ret = checksum_cmp(&buffer[IRQ_EVENT_HEAD_LEN],
 					touch_num * BYTES_PER_POINT + 2,
 					CHECKSUM_MODE_U8_LE);
@@ -1165,6 +1249,7 @@ static int goodix_touch_handler(struct goodix_ts_core *cd,
 		}
 	}
 
+#ifdef CONFIG_TOUCHSCREEN_GOODIX_BRL_PEN
 	if (touch_num > 0 && (point_type == POINT_TYPE_STYLUS
 				|| point_type == POINT_TYPE_STYLUS_HOVER)) {
 		/* stylus info */
@@ -1189,6 +1274,12 @@ static int goodix_touch_handler(struct goodix_ts_core *cd,
 			pre_finger_num = touch_num;
 		}
 	}
+#else
+	/* finger info */
+	ts_event->event_type = EVENT_TOUCH;
+	goodix_parse_finger(touch_data, buffer, touch_num);
+	pre_finger_num = touch_num;
+#endif
 
 	/* process custom info */
 	if (buffer[3] & 0x01)
@@ -1479,6 +1570,28 @@ exit:
 	return ret;
 }
 
+#define GOODIX_CHARGER_CMD	0xAF
+static int brl_charger_on(struct goodix_ts_core *cd, bool on)
+{
+	struct goodix_ts_cmd cmd;
+
+	if (cd->work_status == TP_SLEEP) {
+		ts_info("Unsupported send charger cmd in sleep mode, ");
+		return 0;
+	}
+	cmd.cmd = GOODIX_CHARGER_CMD;
+	cmd.len = 5;
+	cmd.data[0] = (on == true) ? 1 : 0;
+	/* ts_info("gesture data :%*ph", 8, cmd.buf); */
+	if (cd->hw_ops->send_cmd(cd, &cmd)) {
+		ts_err("failed send charger cmd, on = %d", on);
+		return -EINVAL;
+	}
+	ts_info("charger mode %s", (on == true) ? "on" : "off");
+
+	return 0;
+}
+
 static struct goodix_ts_hw_ops brl_hw_ops = {
 	.power_on = brl_power_on,
 	.resume = brl_resume,
@@ -1497,6 +1610,9 @@ static struct goodix_ts_hw_ops brl_hw_ops = {
 	.event_handler = brl_event_handler,
 	.after_event_handler = brl_after_event_handler,
 	.get_capacitance_data = brl_get_capacitance_data,
+	.charger_on = brl_charger_on,
+	.set_coor_mode = brl_set_coor_mode,
+	.switch_report_rate = brl_switch_report_rate,
 };
 
 struct goodix_ts_hw_ops *goodix_get_hw_ops(void)
