@@ -11,6 +11,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
+#include <linux/psi.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/module.h>
@@ -308,12 +309,51 @@ void damos_destroy_filter(struct damos_filter *f)
 	damos_free_filter(f);
 }
 
+struct damos_quota_goal *damos_new_quota_goal(
+		enum damos_quota_goal_metric metric,
+		unsigned long target_value)
+{
+	struct damos_quota_goal *goal;
+
+	goal = kmalloc(sizeof(*goal), GFP_KERNEL);
+	if (!goal)
+		return NULL;
+	goal->metric = metric;
+	goal->target_value = target_value;
+	if (metric == DAMOS_QUOTA_SOME_MEM_PSI_US)
+		goal->last_psi_total = U64_MAX;
+	INIT_LIST_HEAD(&goal->list);
+	return goal;
+}
+
+void damos_add_quota_goal(struct damos_quota *q, struct damos_quota_goal *g)
+{
+	list_add_tail(&g->list, &q->goals);
+}
+
+static void damos_del_quota_goal(struct damos_quota_goal *g)
+{
+	list_del(&g->list);
+}
+
+static void damos_free_quota_goal(struct damos_quota_goal *g)
+{
+	kfree(g);
+}
+
+void damos_destroy_quota_goal(struct damos_quota_goal *g)
+{
+	damos_del_quota_goal(g);
+	damos_free_quota_goal(g);
+}
+
 /* initialize private fields of damos_quota and return the pointer */
 static struct damos_quota *damos_quota_init_priv(struct damos_quota *quota)
 {
 	quota->total_charged_sz = 0;
 	quota->total_charged_ns = 0;
 	quota->esz = 0;
+	quota->esz_bp = 0;
 	quota->charged_sz = 0;
 	quota->charged_from = 0;
 	quota->charge_target_from = NULL;
@@ -346,6 +386,7 @@ struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 	INIT_LIST_HEAD(&scheme->list);
 
 	scheme->quota = *(damos_quota_init_priv(quota));
+	INIT_LIST_HEAD(&scheme->quota.goals);
 
 	scheme->wmarks = *wmarks;
 	scheme->wmarks.activated = true;
@@ -382,7 +423,11 @@ static void damon_free_scheme(struct damos *s)
 
 void damon_destroy_scheme(struct damos *s)
 {
+	struct damos_quota_goal *g, *g_next;
 	struct damos_filter *f, *next;
+
+	damos_for_each_quota_goal_safe(g, g_next, &s->quota)
+		damos_destroy_quota_goal(g);
 
 	damos_for_each_filter_safe(f, next, s)
 		damos_destroy_filter(f);
@@ -1061,26 +1106,299 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 	}
 }
 
-/* Shouldn't be called if quota->ms and quota->sz are zero */
+/*
+ * damon_feed_loop_next_input() - get next input to achieve a target score.
+ * @last_input	The last input.
+ * @score	Current score that made with @last_input.
+ *
+ * Calculate next input to achieve the target score, based on the last input
+ * and current score.  Assuming the input and the score are positively
+ * proportional, calculate how much compensation should be added to or
+ * subtracted from the last input as a proportion of the last input.  Avoid
+ * next input always being zero by setting it non-zero always.  In short form
+ * (assuming support of float and signed calculations), the algorithm is as
+ * below.
+ *
+ * next_input = max(last_input * ((goal - current) / goal + 1), 1)
+ *
+ * For simple implementation, we assume the target score is always 10,000.  The
+ * caller should adjust @score for this.
+ *
+ * Returns next input that assumed to achieve the target score.
+ */
+static unsigned long damon_feed_loop_next_input(unsigned long last_input,
+		unsigned long score)
+{
+	const unsigned long goal = 10000;
+	/* Set minimum input as 10000 to avoid compensation be zero */
+	const unsigned long min_input = 10000;
+	unsigned long score_goal_diff, compensation;
+	bool over_achieving = score > goal;
+
+	if (score == goal)
+		return last_input;
+	if (score >= goal * 2)
+		return min_input;
+
+	score_goal_diff = max(score, goal) - min(score, goal);
+	compensation = mult_frac(last_input, score_goal_diff, goal);
+
+	if (over_achieving)
+		return max(last_input - compensation, min_input);
+	if (last_input < ULONG_MAX - compensation)
+		return last_input + compensation;
+	return ULONG_MAX;
+}
+
+#ifdef CONFIG_PSI
+
+static u64 damos_get_some_mem_psi_total(void)
+{
+	if (static_branch_likely(&psi_disabled))
+		return 0;
+	return div_u64(psi_system.total[PSI_AVGS][PSI_MEM * 2],
+			NSEC_PER_USEC);
+}
+
+#else	/* CONFIG_PSI */
+
+static u64 damos_get_some_mem_psi_total(void)
+{
+	return 0;
+}
+
+#endif	/* CONFIG_PSI */
+
+static void damos_set_psi_current_val(u64 now_psi_total,
+		struct damos_quota_goal *goal)
+{
+	u64 last_psi_total = goal->last_psi_total;
+
+	goal->last_psi_total = now_psi_total;
+	if (last_psi_total != U64_MAX) {
+		goal->current_value = now_psi_total - last_psi_total;
+		return;
+	}
+	/*
+	 * Uninitialized last_psi_total; make no effect this round.  Report the
+	 * goal as already achieved so that the first round doesn't move the
+	 * quota.
+	 */
+	goal->current_value = goal->target_value;
+}
+
+#ifdef CONFIG_NUMA
+static bool invalid_mem_node(int nid)
+{
+	return nid < 0 || nid >= MAX_NUMNODES || !node_state(nid, N_MEMORY);
+}
+
+static unsigned long damos_get_node_mem_bp(
+		struct damos_quota_goal *goal)
+{
+	struct sysinfo i;
+	unsigned long numerator;
+
+	if (invalid_mem_node(goal->nid)) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEM_USED_BP)
+			return 0;
+		/* DAMOS_QUOTA_NODE_MEM_FREE_BP */
+		return 10000;
+	}
+
+	si_meminfo_node(&i, goal->nid);
+	if (!i.totalram || i.totalram < i.freeram) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEM_USED_BP)
+			return 10000;
+		/* DAMOS_QUOTA_NODE_MEM_FREE_BP */
+		return 0;
+	}
+
+	if (goal->metric == DAMOS_QUOTA_NODE_MEM_USED_BP)
+		numerator = i.totalram - i.freeram;
+	else	/* DAMOS_QUOTA_NODE_MEM_FREE_BP */
+		numerator = i.freeram;
+	return mult_frac(numerator, 10000, i.totalram);
+}
+
+static unsigned long damos_get_node_memcg_used_bp(
+		struct damos_quota_goal *goal)
+{
+	struct mem_cgroup *memcg;
+	struct lruvec *lruvec;
+	unsigned long used_pages, numerator;
+	struct sysinfo i;
+
+	if (invalid_mem_node(goal->nid)) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+			return 0;
+		/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+		return 10000;
+	}
+
+	rcu_read_lock();
+	memcg = mem_cgroup_from_id(goal->memcg_id);
+	if (!memcg) {
+		rcu_read_unlock();
+		if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+			return 0;
+		/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+		return 10000;
+	}
+	lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(goal->nid));
+	used_pages = lruvec_page_state(lruvec, NR_ACTIVE_ANON);
+	used_pages += lruvec_page_state(lruvec, NR_INACTIVE_ANON);
+	used_pages += lruvec_page_state(lruvec, NR_ACTIVE_FILE);
+	used_pages += lruvec_page_state(lruvec, NR_INACTIVE_FILE);
+	rcu_read_unlock();
+
+	si_meminfo_node(&i, goal->nid);
+	if (!i.totalram || i.totalram < used_pages) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+			return 10000;
+		/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+		return 0;
+	}
+	if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+		numerator = used_pages;
+	else	/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+		numerator = i.totalram - used_pages;
+	return mult_frac(numerator, 10000, i.totalram);
+}
+#else /* CONFIG_NUMA */
+static unsigned long damos_get_node_mem_bp(
+		struct damos_quota_goal *goal)
+{
+	return 0;
+}
+
+static unsigned long damos_get_node_memcg_used_bp(
+		struct damos_quota_goal *goal)
+{
+	return 0;
+}
+#endif /* CONFIG_NUMA */
+
+/*
+ * Returns LRU-active or inactive memory to total LRU memory size ratio.
+ */
+static unsigned int damos_get_in_active_mem_bp(bool active_ratio)
+{
+	unsigned long active, inactive, total;
+
+	/* This should align with /proc/meminfo output */
+	active = global_node_page_state(NR_LRU_BASE + LRU_ACTIVE_ANON) +
+		global_node_page_state(NR_LRU_BASE + LRU_ACTIVE_FILE);
+	inactive = global_node_page_state(NR_LRU_BASE + LRU_INACTIVE_ANON) +
+		global_node_page_state(NR_LRU_BASE + LRU_INACTIVE_FILE);
+	total = max(active + inactive, 1);
+	if (active_ratio)
+		return mult_frac(active, 10000, total);
+	return mult_frac(inactive, 10000, total);
+}
+
+static unsigned int damos_hugepage_mem_bp(void)
+{
+	unsigned long thp, total_pages, free_pages;
+
+	total_pages = totalram_pages();
+	free_pages = global_zone_page_state(NR_FREE_PAGES);
+
+	if (total_pages <= free_pages)
+		return 10000;
+
+	thp = global_node_page_state(NR_ANON_THPS) +
+				global_node_page_state(NR_SHMEM_THPS) +
+				global_node_page_state(NR_FILE_THPS);
+	return mult_frac(thp, 10000, total_pages - free_pages);
+}
+
+static void damos_set_quota_goal_current_value(struct damos_quota *quota,
+		struct damos_quota_goal *goal)
+{
+	u64 now_psi_total;
+
+	switch (goal->metric) {
+	case DAMOS_QUOTA_USER_INPUT:
+		/* User should already set goal->current_value */
+		break;
+	case DAMOS_QUOTA_SOME_MEM_PSI_US:
+		now_psi_total = damos_get_some_mem_psi_total();
+		damos_set_psi_current_val(now_psi_total, goal);
+		break;
+	case DAMOS_QUOTA_NODE_MEM_USED_BP:
+	case DAMOS_QUOTA_NODE_MEM_FREE_BP:
+		goal->current_value = damos_get_node_mem_bp(goal);
+		break;
+	case DAMOS_QUOTA_NODE_MEMCG_USED_BP:
+	case DAMOS_QUOTA_NODE_MEMCG_FREE_BP:
+		goal->current_value = damos_get_node_memcg_used_bp(goal);
+		break;
+	case DAMOS_QUOTA_ACTIVE_MEM_BP:
+	case DAMOS_QUOTA_INACTIVE_MEM_BP:
+		goal->current_value = damos_get_in_active_mem_bp(
+				goal->metric == DAMOS_QUOTA_ACTIVE_MEM_BP);
+		break;
+	case DAMOS_QUOTA_HUGEPAGE_MEM_BP:
+		goal->current_value = damos_hugepage_mem_bp();
+		break;
+	default:
+		break;
+	}
+}
+
+/* Return the highest score since it makes schemes least aggressive */
+static unsigned long damos_quota_score(struct damos_quota *quota)
+{
+	struct damos_quota_goal *goal;
+	unsigned long highest_score = 0;
+
+	damos_for_each_quota_goal(goal, quota) {
+		/* Target zero is nonsense and will make divide by zero */
+		if (!goal->target_value)
+			continue;
+		damos_set_quota_goal_current_value(quota, goal);
+		highest_score = max(highest_score,
+				mult_frac(goal->current_value, 10000,
+					goal->target_value));
+	}
+
+	return highest_score;
+}
+
+/*
+ * Called only if quota->ms, or quota->sz are set, or quota->goals is not empty
+ */
 static void damos_set_effective_quota(struct damos_quota *quota)
 {
 	unsigned long throughput;
-	unsigned long esz;
+	unsigned long esz = ULONG_MAX;
 
-	if (!quota->ms) {
+	if (!quota->ms && list_empty(&quota->goals)) {
 		quota->esz = quota->sz;
 		return;
 	}
 
-	if (quota->total_charged_ns)
-		throughput = mult_frac(quota->total_charged_sz, 1000000,
-						quota->total_charged_ns);
-	else
-		throughput = PAGE_SIZE * 1024;
-	esz = throughput * quota->ms;
+	if (!list_empty(&quota->goals)) {
+		unsigned long score = damos_quota_score(quota);
+
+		quota->esz_bp = damon_feed_loop_next_input(
+				max(quota->esz_bp, 10000UL), score);
+		esz = quota->esz_bp / 10000;
+	}
+
+	if (quota->ms) {
+		if (quota->total_charged_ns)
+			throughput = mult_frac(quota->total_charged_sz,
+					1000000, quota->total_charged_ns);
+		else
+			throughput = PAGE_SIZE * 1024;
+		esz = min(throughput * quota->ms, esz);
+	}
 
 	if (quota->sz && quota->sz < esz)
 		esz = quota->sz;
+
 	quota->esz = esz;
 }
 
@@ -1092,8 +1410,14 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 	unsigned long cumulated_sz;
 	unsigned int score, max_score = 0;
 
-	if (!quota->ms && !quota->sz)
+	if (!quota->ms && !quota->sz && list_empty(&quota->goals))
 		return;
+
+	/* First charge window */
+	if (!quota->total_charged_sz && !quota->charged_from) {
+		quota->charged_from = jiffies;
+		damos_set_effective_quota(quota);
+	}
 
 	/* New charge window starts */
 	if (time_after_eq(jiffies, quota->charged_from +

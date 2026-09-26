@@ -127,6 +127,80 @@ enum damos_action {
 };
 
 /**
+ * enum damos_quota_goal_metric - Represents the metric to be used as the goal
+ *
+ * @DAMOS_QUOTA_USER_INPUT:	User-input value.
+ * @DAMOS_QUOTA_SOME_MEM_PSI_US:	System level some memory PSI in us.
+ * @DAMOS_QUOTA_NODE_MEM_USED_BP:	MemUsed ratio of a node.
+ * @DAMOS_QUOTA_NODE_MEM_FREE_BP:	MemFree ratio of a node.
+ * @DAMOS_QUOTA_NODE_MEMCG_USED_BP:	MemUsed ratio of a node for a cgroup.
+ * @DAMOS_QUOTA_NODE_MEMCG_FREE_BP:	MemFree ratio of a node for a cgroup.
+ * @DAMOS_QUOTA_ACTIVE_MEM_BP:		Active to total LRU memory ratio.
+ * @DAMOS_QUOTA_INACTIVE_MEM_BP:	Inactive to total LRU memory ratio.
+ * @DAMOS_QUOTA_HUGEPAGE_MEM_BP:	Huge page to total used memory ratio.
+ * @DAMOS_QUOTA_MEM_AVAILABLE_BP:	MemAvailable to total memory ratio.
+ * @NR_DAMOS_QUOTA_GOAL_METRICS:	Number of DAMOS quota goal metrics.
+ *
+ * Metrics equal to larger than @NR_DAMOS_QUOTA_GOAL_METRICS are unsupported.
+ */
+enum damos_quota_goal_metric {
+	DAMOS_QUOTA_USER_INPUT,
+	DAMOS_QUOTA_SOME_MEM_PSI_US,
+	DAMOS_QUOTA_NODE_MEM_USED_BP,
+	DAMOS_QUOTA_NODE_MEM_FREE_BP,
+	DAMOS_QUOTA_NODE_MEMCG_USED_BP,
+	DAMOS_QUOTA_NODE_MEMCG_FREE_BP,
+	DAMOS_QUOTA_ACTIVE_MEM_BP,
+	DAMOS_QUOTA_INACTIVE_MEM_BP,
+	DAMOS_QUOTA_HUGEPAGE_MEM_BP,
+	DAMOS_QUOTA_MEM_AVAILABLE_BP,
+	NR_DAMOS_QUOTA_GOAL_METRICS,
+};
+
+/**
+ * struct damos_quota_goal - DAMOS scheme quota auto-tuning goal.
+ * @metric:		Metric to be used for representing the goal.
+ * @target_value:	Target value of @metric to achieve with the tuning.
+ * @current_value:	Current value of @metric.
+ * @nid:		Node id.
+ * @memcg_id:		Memcg id.
+ * @list:		List head for siblings.
+ *
+ * Data structure for getting the current score of the quota tuning goal.  The
+ * score is calculated by how close @current_value and @target_value are.  Then
+ * the score is entered to DAMON's internal feedback loop mechanism to get the
+ * auto-tuned quota.
+ *
+ * If @metric is DAMOS_QUOTA_USER_INPUT, @current_value should be manually
+ * entered by the user, probably inside the kdamond callbacks.  Otherwise,
+ * DAMON sets @current_value with self-measured value of @metric.
+ *
+ * If @metric is DAMOS_QUOTA_NODE_MEM_{USED,FREE}_BP, @nid represents the node
+ * id of the target node to account the used/free memory.
+ *
+ * If @metric is DAMOS_QUOTA_NODE_MEMCG_{USED,FREE}_BP, @nid and @memcg_id
+ * represents the node id and the cgroup to account the used memory for.
+ */
+struct damos_quota_goal {
+	enum damos_quota_goal_metric metric;
+	unsigned long target_value;
+	unsigned long current_value;
+	/* metric-dependent fields */
+	union {
+		struct {
+			int nid;
+			unsigned short memcg_id;
+		};
+/* private: */
+		/* Last measured total PSI */
+		u64 last_psi_total;
+	};
+/* private: */
+	/* List head for siblings. */
+	struct list_head list;
+};
+
+/**
  * struct damos_quota - Controls the aggressiveness of the given scheme.
  * @ms:			Maximum milliseconds that the scheme can use.
  * @sz:			Maximum bytes of memory that the action can be applied.
@@ -148,6 +222,13 @@ enum damos_action {
  * throughput of the scheme's action.  DAMON then compares it against &sz and
  * uses smaller one as the effective quota.
  *
+ * If goals is not empty, DAMON calculates yet another size quota based on the
+ * goals using its internal feedback loop algorithm, for every @reset_interval.
+ * Then, if the new size quota is smaller than the effective quota, it uses the
+ * new size quota as the effective quota.
+ *
+ * The resulting effective size quota in bytes is set to @esz.
+ *
  * For selecting regions within the quota, DAMON prioritizes current scheme's
  * target memory regions using the &struct damon_operations->get_scheme_score.
  * You could customize the prioritization logic by setting &weight_sz,
@@ -164,11 +245,14 @@ struct damos_quota {
 	unsigned int weight_age;
 
 /* private: */
+	/* Head of quota tuning goals (&damos_quota_goal) list. */
+	struct list_head goals;
 	/* For throughput estimation */
 	unsigned long total_charged_sz;
 	unsigned long total_charged_ns;
 
 	unsigned long esz;	/* Effective size quota in bytes */
+	unsigned long esz_bp;	/* Effective size quota in basis points */
 
 	/* For charging the quota */
 	unsigned long charged_sz;
@@ -629,6 +713,12 @@ static inline unsigned long damon_sz_region(struct damon_region *r)
 #define damos_for_each_filter_safe(f, next, scheme) \
 	list_for_each_entry_safe(f, next, &(scheme)->filters, list)
 
+#define damos_for_each_quota_goal(goal, quota) \
+	list_for_each_entry(goal, &(quota)->goals, list)
+
+#define damos_for_each_quota_goal_safe(goal, next, quota) \
+	list_for_each_entry_safe(goal, next, &(quota)->goals, list)
+
 #ifdef CONFIG_DAMON
 
 struct damon_region *damon_new_region(unsigned long start, unsigned long end);
@@ -655,6 +745,12 @@ struct damos_filter *damos_new_filter(enum damos_filter_type type,
 		bool matching);
 void damos_add_filter(struct damos *s, struct damos_filter *f);
 void damos_destroy_filter(struct damos_filter *f);
+
+struct damos_quota_goal *damos_new_quota_goal(
+		enum damos_quota_goal_metric metric,
+		unsigned long target_value);
+void damos_add_quota_goal(struct damos_quota *q, struct damos_quota_goal *g);
+void damos_destroy_quota_goal(struct damos_quota_goal *goal);
 
 struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
 			enum damos_action action,
