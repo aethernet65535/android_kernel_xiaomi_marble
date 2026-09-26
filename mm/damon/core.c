@@ -1313,6 +1313,21 @@ static unsigned int damos_hugepage_mem_bp(void)
 	return mult_frac(thp, 10000, total_pages - free_pages);
 }
 
+/*
+ * Returns the amount of available memory in basis point of the total memory
+ * size.
+ */
+static unsigned int damos_get_mem_available_bp(void)
+{
+	long available = si_mem_available();
+	unsigned long total = totalram_pages();
+
+	if (!total)
+		return 0;
+	return min(mult_frac((unsigned long)available, 10000, total),
+			10000UL);
+}
+
 static void damos_set_quota_goal_current_value(struct damos_quota *quota,
 		struct damos_quota_goal *goal)
 {
@@ -1341,6 +1356,9 @@ static void damos_set_quota_goal_current_value(struct damos_quota *quota,
 		break;
 	case DAMOS_QUOTA_HUGEPAGE_MEM_BP:
 		goal->current_value = damos_hugepage_mem_bp();
+		break;
+	case DAMOS_QUOTA_MEM_AVAILABLE_BP:
+		goal->current_value = damos_get_mem_available_bp();
 		break;
 	default:
 		break;
