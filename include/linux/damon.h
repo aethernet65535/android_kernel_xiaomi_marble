@@ -201,10 +201,21 @@ struct damos_quota_goal {
 };
 
 /**
+ * enum damos_quota_goal_tuner - Goal-based quota tuning logic.
+ * @DAMOS_QUOTA_GOAL_TUNER_CONSIST:	Aim long term consistent quota.
+ * @DAMOS_QUOTA_GOAL_TUNER_TEMPORAL:	Aim zero quota asap.
+ */
+enum damos_quota_goal_tuner {
+	DAMOS_QUOTA_GOAL_TUNER_CONSIST,
+	DAMOS_QUOTA_GOAL_TUNER_TEMPORAL,
+};
+
+/**
  * struct damos_quota - Controls the aggressiveness of the given scheme.
  * @ms:			Maximum milliseconds that the scheme can use.
  * @sz:			Maximum bytes of memory that the action can be applied.
  * @reset_interval:	Charge reset interval in milliseconds.
+ * @goal_tuner:		Goal-based @esz tuning algorithm to use.
  *
  * @weight_sz:		Weight of the region's size for prioritization.
  * @weight_nr_accesses:	Weight of the region's nr_accesses for prioritization.
@@ -227,6 +238,9 @@ struct damos_quota_goal {
  * Then, if the new size quota is smaller than the effective quota, it uses the
  * new size quota as the effective quota.
  *
+ * The goal-based size quota calculation algorithm is selectable with
+ * @goal_tuner.
+ *
  * The resulting effective size quota in bytes is set to @esz.
  *
  * For selecting regions within the quota, DAMON prioritizes current scheme's
@@ -239,6 +253,7 @@ struct damos_quota {
 	unsigned long ms;
 	unsigned long sz;
 	unsigned long reset_interval;
+	enum damos_quota_goal_tuner goal_tuner;
 
 	unsigned int weight_sz;
 	unsigned int weight_nr_accesses;

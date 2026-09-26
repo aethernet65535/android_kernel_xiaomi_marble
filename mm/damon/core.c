@@ -354,6 +354,7 @@ static struct damos_quota *damos_quota_init_priv(struct damos_quota *quota)
 	quota->total_charged_ns = 0;
 	quota->esz = 0;
 	quota->esz_bp = 0;
+	quota->goal_tuner = DAMOS_QUOTA_GOAL_TUNER_CONSIST;
 	quota->charged_sz = 0;
 	quota->charged_from = 0;
 	quota->charge_target_from = NULL;
@@ -1202,7 +1203,7 @@ static u64 damos_get_some_mem_psi_total(void)
 #endif	/* CONFIG_PSI */
 
 static void damos_set_psi_current_val(u64 now_psi_total,
-		struct damos_quota_goal *goal)
+		struct damos_quota *quota, struct damos_quota_goal *goal)
 {
 	u64 last_psi_total = goal->last_psi_total;
 
@@ -1211,12 +1212,16 @@ static void damos_set_psi_current_val(u64 now_psi_total,
 		goal->current_value = now_psi_total - last_psi_total;
 		return;
 	}
-	/*
-	 * Uninitialized last_psi_total; make no effect this round.  Report the
-	 * goal as already achieved so that the first round doesn't move the
-	 * quota.
-	 */
-	goal->current_value = goal->target_value;
+	/* uninitialized last_psi_total; make no effect this round */
+	if (quota->goal_tuner == DAMOS_QUOTA_GOAL_TUNER_CONSIST) {
+		goal->current_value = goal->target_value;
+		return;
+	}
+	/* let temporal tuner show the same achievement as in the last round */
+	if (!quota->esz)
+		goal->current_value = goal->target_value;
+	else
+		goal->current_value = 0;
 }
 
 #ifdef CONFIG_NUMA
@@ -1371,7 +1376,7 @@ static void damos_set_quota_goal_current_value(struct damos_quota *quota,
 		break;
 	case DAMOS_QUOTA_SOME_MEM_PSI_US:
 		now_psi_total = damos_get_some_mem_psi_total();
-		damos_set_psi_current_val(now_psi_total, goal);
+		damos_set_psi_current_val(now_psi_total, quota, goal);
 		break;
 	case DAMOS_QUOTA_NODE_MEM_USED_BP:
 	case DAMOS_QUOTA_NODE_MEM_FREE_BP:
@@ -1416,6 +1421,26 @@ static unsigned long damos_quota_score(struct damos_quota *quota)
 	return highest_score;
 }
 
+static void damos_goal_tune_esz_bp_consist(struct damos_quota *quota)
+{
+	unsigned long score = damos_quota_score(quota);
+
+	quota->esz_bp = damon_feed_loop_next_input(
+			max(quota->esz_bp, 10000UL), score);
+}
+
+static void damos_goal_tune_esz_bp_temporal(struct damos_quota *quota)
+{
+	unsigned long score = damos_quota_score(quota);
+
+	if (score >= 10000)
+		quota->esz_bp = 0;
+	else if (quota->sz)
+		quota->esz_bp = min(quota->sz, ULONG_MAX / 10000) * 10000;
+	else
+		quota->esz_bp = ULONG_MAX;
+}
+
 /*
  * Called only if quota->ms, or quota->sz are set, or quota->goals is not empty
  */
@@ -1430,10 +1455,11 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 	}
 
 	if (!list_empty(&quota->goals)) {
-		unsigned long score = damos_quota_score(quota);
-
-		quota->esz_bp = damon_feed_loop_next_input(
-				max(quota->esz_bp, 10000UL), score);
+		if (quota->goal_tuner == DAMOS_QUOTA_GOAL_TUNER_CONSIST)
+			damos_goal_tune_esz_bp_consist(quota);
+		else if (quota->goal_tuner ==
+				DAMOS_QUOTA_GOAL_TUNER_TEMPORAL)
+			damos_goal_tune_esz_bp_temporal(quota);
 		esz = quota->esz_bp / 10000;
 	}
 
