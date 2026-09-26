@@ -860,12 +860,43 @@ static bool __damos_valid_target(struct damon_region *r, struct damos *s)
 		r->age <= s->pattern.max_age_region;
 }
 
+/*
+ * damos_quota_is_set() - Check if the given quota is actually set.
+ * @quota:	The quota to check.
+ *
+ * An effective size quota of zero means "unlimited" only if the user didn't
+ * ask any quota at all.  Once a quota of any kind, including a goal, is set,
+ * a zero effective size quota means "do nothing".
+ */
+static bool damos_quota_is_set(struct damos_quota *quota)
+{
+	return quota->esz || quota->sz || quota->ms ||
+		!list_empty(&quota->goals);
+}
+
+/*
+ * damos_quota_is_full() - Check if the quota is fully charged.
+ * @quota:	The quota to check.
+ *
+ * A quota that is not set is never full.  A quota that is set is considered
+ * full also when the remaining quota is smaller than a minimum region, since
+ * no more region can be charged in that case.
+ */
+static bool damos_quota_is_full(struct damos_quota *quota)
+{
+	if (!damos_quota_is_set(quota))
+		return false;
+	if (quota->charged_sz >= quota->esz)
+		return true;
+	return quota->esz - quota->charged_sz < DAMON_MIN_REGION;
+}
+
 static bool damos_valid_target(struct damon_ctx *c, struct damon_target *t,
 		struct damon_region *r, struct damos *s)
 {
 	bool ret = __damos_valid_target(r, s);
 
-	if (!ret || !s->quota.esz || !c->ops.get_scheme_score)
+	if (!ret || !damos_quota_is_set(&s->quota) || !c->ops.get_scheme_score)
 		return ret;
 
 	return c->ops.get_scheme_score(c, t, r, s) >= s->quota.min_score;
@@ -1047,7 +1078,8 @@ static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
 	}
 
 	if (c->ops.apply_scheme) {
-		if (quota->esz && quota->charged_sz + sz > quota->esz) {
+		if (damos_quota_is_set(quota) &&
+				quota->charged_sz + sz > quota->esz) {
 			sz = ALIGN_DOWN(quota->esz - quota->charged_sz,
 					DAMON_MIN_REGION);
 			if (!sz)
@@ -1068,7 +1100,7 @@ static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
 		quota->total_charged_ns += timespec64_to_ns(&end) -
 			timespec64_to_ns(&begin);
 		quota->charged_sz += sz;
-		if (quota->esz && quota->charged_sz >= quota->esz) {
+		if (damos_quota_is_full(quota)) {
 			quota->charge_target_from = t;
 			quota->charge_addr_from = r->ar.end + 1;
 		}
@@ -1093,7 +1125,7 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 			continue;
 
 		/* Check the quota */
-		if (quota->esz && quota->charged_sz >= quota->esz)
+		if (damos_quota_is_full(quota))
 			continue;
 
 		if (damos_skip_charged_region(t, &r, s))
@@ -1428,7 +1460,7 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 	unsigned long cumulated_sz;
 	unsigned int score, max_score = 0;
 
-	if (!quota->ms && !quota->sz && list_empty(&quota->goals))
+	if (!damos_quota_is_set(quota))
 		return;
 
 	/* First charge window */
@@ -1440,7 +1472,7 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 	/* New charge window starts */
 	if (time_after_eq(jiffies, quota->charged_from +
 				msecs_to_jiffies(quota->reset_interval))) {
-		if (quota->esz && quota->charged_sz >= quota->esz)
+		if (damos_quota_is_full(quota))
 			s->stat.qt_exceeds++;
 		quota->total_charged_sz += quota->charged_sz;
 		quota->charged_from = jiffies;
