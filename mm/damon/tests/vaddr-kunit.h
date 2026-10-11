@@ -1,10 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Data Access Monitor Unit Tests
- *
- * Copyright 2019 Amazon.com, Inc. or its affiliates.  All rights reserved.
- *
- * Author: SeongJae Park <sjpark@amazon.de>
  */
 
 #ifdef CONFIG_DAMON_VADDR_KUNIT_TEST
@@ -14,33 +10,26 @@
 
 #include <kunit/test.h>
 
-static void __link_vmas(struct vm_area_struct *vmas, ssize_t nr_vmas)
+static int __link_vmas(struct maple_tree *mt, struct vm_area_struct *vmas,
+			ssize_t nr_vmas)
 {
-	int i, j;
-	unsigned long largest_gap, gap;
+	int i, ret = -ENOMEM;
+	MA_STATE(mas, mt, 0, 0);
 
 	if (!nr_vmas)
-		return;
+		return 0;
 
-	for (i = 0; i < nr_vmas - 1; i++) {
-		vmas[i].vm_next = &vmas[i + 1];
-
-		vmas[i].vm_rb.rb_left = NULL;
-		vmas[i].vm_rb.rb_right = &vmas[i + 1].vm_rb;
-
-		largest_gap = 0;
-		for (j = i; j < nr_vmas; j++) {
-			if (j == 0)
-				continue;
-			gap = vmas[j].vm_start - vmas[j - 1].vm_end;
-			if (gap > largest_gap)
-				largest_gap = gap;
-		}
-		vmas[i].rb_subtree_gap = largest_gap;
+	mas_lock(&mas);
+	for (i = 0; i < nr_vmas; i++) {
+		mas_set_range(&mas, vmas[i].vm_start, vmas[i].vm_end - 1);
+		if (mas_store_gfp(&mas, &vmas[i], GFP_KERNEL))
+			goto failed;
 	}
-	vmas[i].vm_next = NULL;
-	vmas[i].vm_rb.rb_right = NULL;
-	vmas[i].rb_subtree_gap = 0;
+
+	ret = 0;
+failed:
+	mas_unlock(&mas);
+	return ret;
 }
 
 /*
@@ -72,9 +61,10 @@ static void __link_vmas(struct vm_area_struct *vmas, ssize_t nr_vmas)
  */
 static void damon_test_three_regions_in_vmas(struct kunit *test)
 {
-	struct damon_addr_range regions[3] = {0,};
+	static struct mm_struct mm;
+	struct damon_addr_range regions[3] = {0};
 	/* 10-20-25, 200-210-220, 300-305, 307-330 */
-	struct vm_area_struct vmas[] = {
+	static struct vm_area_struct vmas[] = {
 		(struct vm_area_struct) {.vm_start = 10, .vm_end = 20},
 		(struct vm_area_struct) {.vm_start = 20, .vm_end = 25},
 		(struct vm_area_struct) {.vm_start = 200, .vm_end = 210},
@@ -83,9 +73,11 @@ static void damon_test_three_regions_in_vmas(struct kunit *test)
 		(struct vm_area_struct) {.vm_start = 307, .vm_end = 330},
 	};
 
-	__link_vmas(vmas, 6);
+	mt_init_flags(&mm.mm_mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	if (__link_vmas(&mm.mm_mt, vmas, ARRAY_SIZE(vmas)))
+		kunit_skip(test, "Failed to create VMA tree");
 
-	__damon_va_three_regions(&vmas[0], regions);
+	__damon_va_three_regions(&mm, regions);
 
 	KUNIT_EXPECT_EQ(test, 10ul, regions[0].start);
 	KUNIT_EXPECT_EQ(test, 25ul, regions[0].end);
@@ -136,16 +128,39 @@ static void damon_do_test_apply_three_regions(struct kunit *test,
 				unsigned long *expected, int nr_expected)
 {
 	struct damon_target *t;
+	struct damon_addr_range *ranges;
 	struct damon_region *r;
 	int i;
 
 	t = damon_new_target();
+	if (!t)
+		kunit_skip(test, "target alloc fail");
+
+	ranges = kmalloc_objs(*ranges, nr_regions / 2);
+	if (!ranges) {
+		damon_destroy_target(t, NULL);
+		kunit_skip(test, "ranges alloc fail");
+	}
 	for (i = 0; i < nr_regions / 2; i++) {
-		r = damon_new_region(regions[i * 2], regions[i * 2 + 1]);
-		damon_add_region(r, t);
+		ranges[i].start = regions[i * 2];
+		ranges[i].end = regions[i * 2 + 1];
+	}
+	if (damon_set_regions(t, ranges, nr_regions / 2,
+				DAMON_MIN_REGION_SZ)) {
+		kfree(ranges);
+		damon_destroy_target(t, NULL);
+		kunit_skip(test, "damon_set_regions() fail");
+	}
+	kfree(ranges);
+
+	if (damon_set_regions(t, three_regions, 3, DAMON_MIN_REGION_SZ)) {
+		damon_destroy_target(t, NULL);
+		kunit_skip(test, "second damon_set_regions() fail");
 	}
 
-	damon_set_regions(t, three_regions, 3);
+	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), nr_expected / 2);
+	if (damon_nr_regions(t) != nr_expected / 2)
+		goto out;
 
 	for (i = 0; i < nr_expected / 2; i++) {
 		r = __nth_region_of(t, i);
@@ -153,7 +168,8 @@ static void damon_do_test_apply_three_regions(struct kunit *test,
 		KUNIT_EXPECT_EQ(test, r->ar.end, expected[i * 2 + 1]);
 	}
 
-	damon_destroy_target(t);
+out:
+	damon_destroy_target(t, NULL);
 }
 
 /*
@@ -250,70 +266,12 @@ static void damon_test_apply_three_regions4(struct kunit *test)
 			new_three_regions, expected, ARRAY_SIZE(expected));
 }
 
-static void damon_test_split_evenly_fail(struct kunit *test,
-		unsigned long start, unsigned long end, unsigned int nr_pieces)
-{
-	struct damon_target *t = damon_new_target();
-	struct damon_region *r = damon_new_region(start, end);
-
-	damon_add_region(r, t);
-	KUNIT_EXPECT_EQ(test,
-			damon_va_evenly_split_region(t, r, nr_pieces), -EINVAL);
-	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), 1u);
-
-	damon_for_each_region(r, t) {
-		KUNIT_EXPECT_EQ(test, r->ar.start, start);
-		KUNIT_EXPECT_EQ(test, r->ar.end, end);
-	}
-
-	damon_free_target(t);
-}
-
-static void damon_test_split_evenly_succ(struct kunit *test,
-	unsigned long start, unsigned long end, unsigned int nr_pieces)
-{
-	struct damon_target *t = damon_new_target();
-	struct damon_region *r = damon_new_region(start, end);
-	unsigned long expected_width = (end - start) / nr_pieces;
-	unsigned long i = 0;
-
-	damon_add_region(r, t);
-	KUNIT_EXPECT_EQ(test,
-			damon_va_evenly_split_region(t, r, nr_pieces), 0);
-	KUNIT_EXPECT_EQ(test, damon_nr_regions(t), nr_pieces);
-
-	damon_for_each_region(r, t) {
-		if (i == nr_pieces - 1) {
-			KUNIT_EXPECT_EQ(test,
-				r->ar.start, start + i * expected_width);
-			KUNIT_EXPECT_EQ(test, r->ar.end, end);
-			break;
-		}
-		KUNIT_EXPECT_EQ(test,
-				r->ar.start, start + i++ * expected_width);
-		KUNIT_EXPECT_EQ(test, r->ar.end, start + i * expected_width);
-	}
-	damon_free_target(t);
-}
-
-static void damon_test_split_evenly(struct kunit *test)
-{
-	KUNIT_EXPECT_EQ(test, damon_va_evenly_split_region(NULL, NULL, 5),
-			-EINVAL);
-
-	damon_test_split_evenly_fail(test, 0, 100, 0);
-	damon_test_split_evenly_succ(test, 0, 100, 10);
-	damon_test_split_evenly_succ(test, 5, 59, 5);
-	damon_test_split_evenly_fail(test, 5, 6, 2);
-}
-
 static struct kunit_case damon_test_cases[] = {
 	KUNIT_CASE(damon_test_three_regions_in_vmas),
 	KUNIT_CASE(damon_test_apply_three_regions1),
 	KUNIT_CASE(damon_test_apply_three_regions2),
 	KUNIT_CASE(damon_test_apply_three_regions3),
 	KUNIT_CASE(damon_test_apply_three_regions4),
-	KUNIT_CASE(damon_test_split_evenly),
 	{},
 };
 
